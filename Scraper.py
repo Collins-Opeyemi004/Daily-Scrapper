@@ -14,22 +14,23 @@ leaderboard_data = []
 def click_x_icons_and_get_urls(page):
     """
     From the loaded leaderboard page, clicks each player's X icon,
-    captures the popup URL (or same‑tab navigation), and returns a list
+    captures the popup URL (or same-tab navigation), and returns a list
     of Twitter/X URLs (or "N/A" if not available).
     """
     x_urls = []
-    # Wait until the containers are present (15s timeout)
-    page.wait_for_selector("div.leaderboard_leaderboardUser__8OZpJ", timeout=15000)
+    # Wait up to 10s for the containers (reduced from 15s)
+    page.wait_for_selector("div.leaderboard_leaderboardUser__8OZpJ", timeout=10000)
     players_locator = page.locator("div.leaderboard_leaderboardUser__8OZpJ")
     count = players_locator.count()
-    
+
     for i in range(count):
         container = players_locator.nth(i)
         x_icon = container.locator("img[src*='Twitter.webp'], img[src*='twitter.png']")
-        
+
         if x_icon.count() > 0:
+            # Try a popup first
             try:
-                with page.expect_popup(timeout=5000) as popup_info:
+                with page.expect_popup(timeout=3000) as popup_info:
                     x_icon.first.click(force=True)
                 popup_page = popup_info.value
                 x_url = popup_page.url
@@ -38,9 +39,10 @@ def click_x_icons_and_get_urls(page):
                     x_urls.append(x_url)
                 else:
                     x_urls.append("N/A")
-            except Exception:
+            except:
+                # Fallback: same-tab navigation
                 try:
-                    with page.expect_navigation(timeout=5000):
+                    with page.expect_navigation(timeout=3000):
                         x_icon.first.click(force=True)
                     new_url = page.url
                     if "twitter.com" in new_url or "x.com" in new_url:
@@ -48,22 +50,27 @@ def click_x_icons_and_get_urls(page):
                         page.go_back()
                     else:
                         x_urls.append("N/A")
-                except Exception:
+                except:
                     x_urls.append("N/A")
         else:
             x_urls.append("N/A")
+
     return x_urls
 
 def scrape_leaderboard():
     global leaderboard_data
     leaderboard_url = "https://kolscan.io/leaderboard"
 
-    # ---- Step 1: Basic data extraction via requests and BeautifulSoup ----
+    # 1) Basic data extraction via requests + BeautifulSoup
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
     }
     try:
-        resp = requests.get(leaderboard_url, headers=headers, timeout=10)
+        resp = requests.get(leaderboard_url, headers=headers, timeout=8)  # shorter request timeout
         resp.raise_for_status()
     except Exception as e:
         print(f"❌ Failed to fetch leaderboard page: {e}")
@@ -89,18 +96,18 @@ def scrape_leaderboard():
             else:
                 rank_element = player.select_one(".leaderboard_rank")
                 rank = rank_element.text.strip() if rank_element else "N/A"
-            
+
             profile_icon = player.select_one("img")["src"]
             profile_url = player.select_one("a")["href"]
             wallet_address = profile_url.split("/account/")[-1] if "/account/" in profile_url else "N/A"
             name_element = player.select_one("a h1")
             name = name_element.text.strip() if name_element else "Unknown"
-            
+
             stats = player.select(".remove-mobile p")
             sol_number = player.select_one(".leaderboard_totalProfitNum__HzfFO h1:nth-child(1)").text.strip()
             dollar_value = player.select_one(".leaderboard_totalProfitNum__HzfFO h1:nth-child(2)").text.strip()
             full_profile_url = f"https://kolscan.io{profile_url}"
-            
+
             partial_data.append({
                 "rank": rank,
                 "profile_icon": profile_icon,
@@ -115,12 +122,13 @@ def scrape_leaderboard():
         except Exception as e:
             print(f"❌ Error extracting data: {e}")
 
-    # ---- Step 2: Use Playwright (sync) to click on X icons and capture Twitter/X URLs ----
+    # 2) Use Playwright to click on X icons
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--disable-gpu", "--no-sandbox"])
         page = browser.new_page()
         try:
-            page.goto(leaderboard_url, timeout=15000)
+            # Use a shorter 10s timeout, wait until DOM is loaded
+            page.goto(leaderboard_url, timeout=10000, wait_until="domcontentloaded")
         except Exception as e:
             print(f"❌ Playwright navigation failed: {e}")
             browser.close()
@@ -129,20 +137,17 @@ def scrape_leaderboard():
         x_urls = click_x_icons_and_get_urls(page)
         browser.close()
 
-    # ---- Step 3: Combine data from BeautifulSoup and Playwright ----
+    # 3) Combine data
     leaderboard = []
     for i, p_data in enumerate(partial_data):
-        if i < len(x_urls):
-            p_data["x_profile_url"] = x_urls[i]
-        else:
-            p_data["x_profile_url"] = "N/A"
+        p_data["x_profile_url"] = x_urls[i] if i < len(x_urls) else "N/A"
         leaderboard.append(p_data)
 
     leaderboard_data = leaderboard
 
-    # ---- Step 4: Send data to Make.com webhook ----
+    # 4) Send data to Make.com webhook
     try:
-        r = requests.post(WEBHOOK_URL, json={"data": leaderboard}, timeout=10)
+        r = requests.post(WEBHOOK_URL, json={"data": leaderboard}, timeout=8)
         r.raise_for_status()
         print(f"✅ Data sent successfully: {r.status_code}")
     except Exception as e:
@@ -157,7 +162,8 @@ schedule.every(6).hours.do(scrape_leaderboard_wrapper)
 def run_scheduler():
     while True:
         schedule.run_pending()
-        time.sleep(60)
+        # Check every 30s instead of 60s if you want slightly faster trigger
+        time.sleep(30)
 
 threading.Thread(target=run_scheduler, daemon=True).start()
 
