@@ -11,14 +11,10 @@ app = Flask(__name__)
 WEBHOOK_URL = "https://hook.us2.make.com/8ng1v9fw7x63kfsrw4siix8a7jdyybqi"  # Replace with your webhook URL
 leaderboard_data = []
 
+
 def click_x_icons_and_get_urls(page):
-    """
-    From the loaded leaderboard page, clicks each player's X icon,
-    captures the popup URL (or same-tab navigation), and returns a list
-    of Twitter/X URLs (or "N/A" if not available).
-    """
+    """Extracts X (Twitter) profile links by clicking icons."""
     x_urls = []
-    # Wait up to 10s for the containers (reduced from 15s)
     page.wait_for_selector("div.leaderboard_leaderboardUser__8OZpJ", timeout=10000)
     players_locator = page.locator("div.leaderboard_leaderboardUser__8OZpJ")
     count = players_locator.count()
@@ -28,28 +24,20 @@ def click_x_icons_and_get_urls(page):
         x_icon = container.locator("img[src*='Twitter.webp'], img[src*='twitter.png']")
 
         if x_icon.count() > 0:
-            # Try a popup first
             try:
                 with page.expect_popup(timeout=3000) as popup_info:
                     x_icon.first.click(force=True)
                 popup_page = popup_info.value
                 x_url = popup_page.url
                 popup_page.close()
-                if "twitter.com" in x_url or "x.com" in x_url:
-                    x_urls.append(x_url)
-                else:
-                    x_urls.append("N/A")
+                x_urls.append(x_url if "twitter.com" in x_url or "x.com" in x_url else "N/A")
             except:
-                # Fallback: same-tab navigation
                 try:
                     with page.expect_navigation(timeout=3000):
                         x_icon.first.click(force=True)
                     new_url = page.url
-                    if "twitter.com" in new_url or "x.com" in new_url:
-                        x_urls.append(new_url)
-                        page.go_back()
-                    else:
-                        x_urls.append("N/A")
+                    x_urls.append(new_url if "twitter.com" in new_url or "x.com" in new_url else "N/A")
+                    page.go_back()
                 except:
                     x_urls.append("N/A")
         else:
@@ -57,20 +45,15 @@ def click_x_icons_and_get_urls(page):
 
     return x_urls
 
+
 def scrape_leaderboard():
+    """Scrapes leaderboard data and sends it to Make.com webhook."""
     global leaderboard_data
     leaderboard_url = "https://kolscan.io/leaderboard"
 
-    # 1) Basic data extraction via requests + BeautifulSoup
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"}
     try:
-        resp = requests.get(leaderboard_url, headers=headers, timeout=8)  # shorter request timeout
+        resp = requests.get(leaderboard_url, headers=headers, timeout=8)
         resp.raise_for_status()
     except Exception as e:
         print(f"❌ Failed to fetch leaderboard page: {e}")
@@ -79,29 +62,22 @@ def scrape_leaderboard():
     soup = BeautifulSoup(resp.text, "html.parser")
     players = soup.select(".leaderboard_leaderboardUser__8OZpJ")
     if not players:
-        print("⚠️ No leaderboard data found. The page structure might have changed.")
+        print("⚠️ No leaderboard data found.")
         return
 
     partial_data = []
     for player in players:
         try:
-            # Extract rank
             classes = player.get("class", [])
-            if any("firstPlace" in cls for cls in classes):
-                rank = "1"
-            elif any("secondPlace" in cls for cls in classes):
-                rank = "2"
-            elif any("thirdPlace" in cls for cls in classes):
-                rank = "3"
-            else:
-                rank_element = player.select_one(".leaderboard_rank")
-                rank = rank_element.text.strip() if rank_element else "N/A"
+            rank = "1" if any("firstPlace" in cls for cls in classes) else \
+                   "2" if any("secondPlace" in cls for cls in classes) else \
+                   "3" if any("thirdPlace" in cls for cls in classes) else \
+                   player.select_one(".leaderboard_rank").text.strip() if player.select_one(".leaderboard_rank") else "N/A"
 
             profile_icon = player.select_one("img")["src"]
             profile_url = player.select_one("a")["href"]
             wallet_address = profile_url.split("/account/")[-1] if "/account/" in profile_url else "N/A"
-            name_element = player.select_one("a h1")
-            name = name_element.text.strip() if name_element else "Unknown"
+            name = player.select_one("a h1").text.strip() if player.select_one("a h1") else "Unknown"
 
             stats = player.select(".remove-mobile p")
             sol_number = player.select_one(".leaderboard_totalProfitNum__HzfFO h1:nth-child(1)").text.strip()
@@ -122,22 +98,20 @@ def scrape_leaderboard():
         except Exception as e:
             print(f"❌ Error extracting data: {e}")
 
-    # 2) Use Playwright to click on X icons
+    # Get X (Twitter) profiles using Playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--disable-gpu", "--no-sandbox"])
         page = browser.new_page()
         try:
-            # Use a shorter 10s timeout, wait until DOM is loaded
             page.goto(leaderboard_url, timeout=10000, wait_until="domcontentloaded")
+            x_urls = click_x_icons_and_get_urls(page)
         except Exception as e:
             print(f"❌ Playwright navigation failed: {e}")
+            x_urls = ["N/A"] * len(partial_data)
+        finally:
             browser.close()
-            return
 
-        x_urls = click_x_icons_and_get_urls(page)
-        browser.close()
-
-    # 3) Combine data
+    # Merge data
     leaderboard = []
     for i, p_data in enumerate(partial_data):
         p_data["x_profile_url"] = x_urls[i] if i < len(x_urls) else "N/A"
@@ -145,7 +119,7 @@ def scrape_leaderboard():
 
     leaderboard_data = leaderboard
 
-    # 4) Send data to Make.com webhook
+    # Send to Make.com webhook
     try:
         r = requests.post(WEBHOOK_URL, json={"data": leaderboard}, timeout=8)
         r.raise_for_status()
@@ -153,28 +127,37 @@ def scrape_leaderboard():
     except Exception as e:
         print(f"❌ Failed to send data: {e}")
 
+
 def scrape_leaderboard_wrapper():
+    """Wrapper function to run scraper."""
     scrape_leaderboard()
 
-# Schedule the scraper to run every 6 hours
+
+# Schedule scraper every 6 hours
 schedule.every(6).hours.do(scrape_leaderboard_wrapper)
 
+
 def run_scheduler():
+    """Background scheduler thread."""
     while True:
         schedule.run_pending()
-        # Check every 30s instead of 60s if you want slightly faster trigger
         time.sleep(30)
 
+
 threading.Thread(target=run_scheduler, daemon=True).start()
+
 
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({"message": "Welcome to your scraping API! Use /scrape to trigger scraping."})
 
+
 @app.route("/scrape", methods=["GET"])
 def manual_scrape():
-    scrape_leaderboard_wrapper()
-    return jsonify({"message": "Scraping triggered!", "data": leaderboard_data})
+    """Trigger scraping and return JSON output."""
+    scrape_leaderboard_wrapper()  # Run scraper before returning data
+    return jsonify({"message": "Scraping completed!", "data": leaderboard_data})  # Returns scraped data
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=True)
